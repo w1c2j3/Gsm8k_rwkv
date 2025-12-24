@@ -49,7 +49,6 @@ def _normalize_gold_answer(raw):
 
 
 def load_questions(args):
-    # auto download official gsm8k test if file missing
     target_path = Path(args.input)
     if not target_path.exists():
         print(f"{target_path} not found, downloading official GSM8K test split...")
@@ -410,7 +409,6 @@ def main():
             total_acc += 1 if got_correct[idx] else 0
 
             gen_text = first_hit_text[idx] if got_correct[idx] and first_hit_text[idx] else first_sample_text[idx]
-            # 只从最终回答段提取，避免回溯到 CoT/题面
             final_only = gen_text.split("Therefore, the answer is ", 1)
             final_segment = final_only[1] if len(final_only) > 1 else gen_text
             pred = extract_number(final_segment)

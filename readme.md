@@ -82,8 +82,17 @@
 
 ## 5. 快速运行指令 (CLI)
 
+### 环境安装（nightly cu128）
+
 ```bash
-python benchmark_gsm8k.py \
+# 安装 PyTorch 夜ly cu128
+uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+# 安装本项目依赖
+uv pip install -r requirements.txt
+```
+
+```bash
+python gsm8k_rollout.py \
     --model "/path/to/rwkv7-model" \
     --batch 16 \
     --passes 1 \
