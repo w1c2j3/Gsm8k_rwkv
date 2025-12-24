@@ -83,18 +83,23 @@
 ## 5. 快速运行指令 (CLI)
 
 ### 环境安装（nightly cu128）
-
+我的常用显卡是5070ti，是120结构，所以使用12.8版本的torch，虚拟环境的是uv
 ```bash
-# 安装 PyTorch 夜ly cu128
 uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
-# 安装本项目依赖
 uv pip install -r requirements.txt
 ```
 
+### 使用说明
+- 将 `--model` 替换为本地 RWKV7 模型前缀路径（不含 `.pth`），可以直接使用绝对路径。
+- 不传 `--input` 时默认自动下载官方 GSM8K test split；`--question` 可直接评单题。
+- `--passes` 控制 Pass@k；`--cot_max_len` / `--final_max_len` 为两阶段长度。
+- check.py是用于检查答案的，避免在运行的时候没有完整记录下来
+
 ```bash
-python gsm8k_rollout.py \
-    --model "/path/to/rwkv7-model" \
-    --batch 16 \
-    --passes 1 \
-    --cot_max_len 512 \
-    --final_max_len 64
+ python gsm8k_rollout.py `                                                                                                                                                                                     
+>>   --model "path" `
+>>   --batch 8 `
+>>   --cot_max_len 512 `
+>>   --final_max_len 64 `
+>>   --passes 1 `
+>>   --output "out\gsm8k_0p1b.jsonl"
