@@ -9,9 +9,7 @@ RWKV使用GSM8K数据集来做rollout：测试RWKV模型的数学能力和潜力
 
 rwkv作为训练时可并行模型，在推理时它是线性的。可以保持在N（1）复杂度情况下实现SOTA的效果。
 在rwkv模型中state就是一个非常重要的特征，通过动态计算更新 state，从上下文动态学习 key 和 value 之间的关系，再使用更新后的 state 处理新的输入 
-q
 q（在 RWKV 中是 
-r
 r） 并得到输出。
 RWKV的state更新方程：  
 新状态 = 衰减系数 × 旧状态 + 输入带来的新信息
@@ -26,7 +24,29 @@ $$
 * $\mathbf{k}_t$: Key 向量。
 * $\mathbf{v}_t$: Value 向量。
 * $\mathbf{a}_t$: 学习率/锚点向量 (In-context Learning Rate)。这是 v7 的核心引入变量，控制对当前 Key 的更新强度，使模型能执行“差分更新”。
+其中，合理的初始值选择为：
 
+a
+=
+−
+k
+,
+b
+=
+k
+⋅
+η
+,
+v
+=
+v
+,
+k
+=
+k
+⋅
+η
+a=−k,b=k⋅η,v=v,k=k⋅η
 数据集使用了 https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl 中的 openai 开源 GSM8K 测试集，一共 1319 条测试数据。
 
 原始数据格式：
