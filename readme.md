@@ -8,9 +8,12 @@ RWKV使用GSM8K数据集来做rollout：测试RWKV模型的数学能力和潜力
 | **Stage 2: Answer** | 数值收敛 | 引导 `Therefore, the answer is \(\boxed{`top_k=1确保只选概率最大的那个词，Alpha Presence = 0.0是因为数字经常包含重复位
 
 rwkv作为训练时可并行模型，在推理时它是线性的。可以保持在N（1）复杂度情况下实现SOTA的效果。
-在rwkv模型中state就是一个非常重要的特征。
-而RWKV的state更新方程：  
-新状态 = 衰减系数 × 旧状态 + 输入带来的新信息  
+在rwkv模型中state就是一个非常重要的特征，通过动态计算更新 state，从上下文动态学习 key 和 value 之间的关系，再使用更新后的 state 处理新的输入 
+q
+q（在 RWKV 中是 
+r
+r） 并得到输出。
+RWKV的state更新方程：  
 新状态 = 衰减系数 × 旧状态 + 输入带来的新信息
 
 $$
