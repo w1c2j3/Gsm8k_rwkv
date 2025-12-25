@@ -11,13 +11,18 @@ rwkv作为训练时可并行模型，在推理时它是线性的。可以保持�
 在rwkv模型中state就是一个非常重要的特征。
 而RWKV的state更新方程：  
 新状态 = 衰减系数 × 旧状态 + 输入带来的新信息  
-$$\mathbf{S}_t = \mathbf{S}_{t-1} \cdot (\text{diag}(\mathbf{w}_t) + \mathbf{a}_t^\top \mathbf{b}_t) + \mathbf{v}_t^\top \mathbf{k}_t$$
-$$\mathbf{S}_t \in \mathbb{R}^{D \times D}$$ : 当前时刻的隐藏状态矩阵（针对单个Head）。  
-$$\mathbf{S}_{t-1}$$ : 上一时刻的状态。  
-$$\mathbf{w}_t$$ : 动态衰减向量 (Decay)。控制遗忘速度，由输入数据动态生成（Data-dependent），而非固定参数。  
-$$\mathbf{k}_t$$ : Key向量。  
-$$\mathbf{v}_t$$ : Value向量。  
-$$\mathbf{a}_t$$ : 学习率/锚点向量 (In-context Learning Rate)。这是v7的核心引入变量，控制对当前Key的更新强度，使模型能执行“差分更新”。
+新状态 = 衰减系数 × 旧状态 + 输入带来的新信息
+
+$$
+\mathbf{S}_t = \mathbf{S}_{t-1} \cdot (\text{diag}(\mathbf{w}_t) + \mathbf{a}_t^\top \mathbf{b}_t) + \mathbf{v}_t^\top \mathbf{k}_t
+$$
+
+* $\mathbf{S}_t \in \mathbb{R}^{D \times D}$: 当前时刻的隐藏状态矩阵（针对单个 Head）。
+* $\mathbf{S}_{t-1}$: 上一时刻的状态。
+* $\mathbf{w}_t$: 动态衰减向量 (Decay)。控制遗忘速度，由输入数据动态生成 (Data-dependent)，而非固定参数。
+* $\mathbf{k}_t$: Key 向量。
+* $\mathbf{v}_t$: Value 向量。
+* $\mathbf{a}_t$: 学习率/锚点向量 (In-context Learning Rate)。这是 v7 的核心引入变量，控制对当前 Key 的更新强度，使模型能执行“差分更新”。
 
 数据集使用了 https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl 中的 openai 开源 GSM8K 测试集，一共 1319 条测试数据。
 
@@ -133,7 +138,7 @@ if pred and gold and float(pred) == float(gold):
 | Alpha Presence | `0.5` | `0.0` | CoT: 强惩罚复读；Final: 允许数字自然出现。         |
 | Alpha Decay | `0.99` | `0.99` | 核心参数：控制 RNN 状态随 Token 推进的衰减，维持长期记忆。         |
 
-当前项目使用显卡是 5070ti，sm120 架构，请根据您的显卡更改 torch 的下载脚本：
+当前项目使用显卡是 5070ti，sm120 架构，请根据您的显卡更改 torch 的下载命令：
 
 ```bash
 uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
@@ -141,7 +146,7 @@ uv pip install -r requirements.txt
 ```
 
 运行命令：
-
+passes的数值可以控制rwkv模型对同一个题目测试几次。model可以直接使用绝对路径。
 ```bash
 python gsm8k_rollout.py \
   --model "path" \
