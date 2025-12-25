@@ -4,8 +4,8 @@ RWKV使用GSM8K数据集来做rollout：测试RWKV模型的数学能力和潜力
 各种参数参考rwkv skills（https://github.com/rwkv-rs/rwkv-skills） 。
 
 使用本系统采用 **Two-Stage Logic (两阶段逻辑)** 采样流程，通过 `argparse` 灵活配置不同阶段的最大长度：
-| **Stage 1: Reasoning** | 逻辑推导 | 强制触发 `<think>` 标签，低温度探索路径，确保选择概率最高的Token
-| **Stage 2: Answer** | 数值收敛 | 引导 `Therefore, the answer is \(\boxed{`top_k=1确保只选概率最大的那个词，Alpha Presence = 0.0是因为数字经常包含重复位
+ **Stage 1: Reasoning** 是逻辑推导  强制触发 `<think>` 标签，低温度探索路径，确保选择概率最高的Token
+ **Stage 2: Answer** 数值收敛   在Stage1和2之间还会直接插入 在Stage1和2之间还会直接插入 `Therefore, the answer is \(\boxed{`，引导模型的答案输出格式，top_k=1确保只选概率最大的那个词，Alpha Presence = 0.0是因为数字经常包含重复位
 
 rwkv作为训练时可并行模型，在推理时它是线性的。可以保持在N（1）复杂度情况下实现SOTA的效果。
 在rwkv模型中state就是一个非常重要的特征，通过动态计算更新 state，从上下文动态学习 key 和 value 之间的关系，再使用更新后的 state 处理新的输入 
