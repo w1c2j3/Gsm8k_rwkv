@@ -91,7 +91,7 @@ Gold: 540 | Pred: 540 | exact=True
 Generated: ...<think>First, calculate the distance...
 Therefore, the answer is \( \boxed{540} \)
 ----------------------------------------
-GSM8K rollout done. samples=1319 acc=0.452
+GSM8K rollout done. samples=1319 acc=0.585
 ```
 ### 结果文件（jsonl）
 由 --output 指定的文件将包含完整评测细节：
