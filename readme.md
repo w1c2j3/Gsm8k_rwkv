@@ -104,15 +104,15 @@ GSM8K rollout done. samples=1319 acc=0.585
   "gen": "User: ...\n\nAssistant: <think>...Therefore, the answer is \\(\\boxed{3}"
 }
 ```
-字段说明：
-question：原始问题
-gold：标准答案（已清洗）
-pred：模型预测数值
-correct：是否命中
-gen：完整生成文本（含 CoT）
+### 字段说明：
+#### question：原始问题
+#### gold：标准答案（已清洗）
+#### pred：模型预测数值
+#### correct：是否命中
+#### gen：完整生成文本（含 CoT）
 
 ## 7. 代码结构 (Code Structure)
-load_questions：数据加载与预处理（含特例修复）
-_normalize_gold_answer / extract_number：答案清洗与数值提取
-sample_top_k_top_p_with_penalty：自定义采样内核（Penalty + 动态温度）
-main：主评测循环（State Snapshot 复用 + Two-Stage 切换）
+#### load_questions：数据加载与预处理（含特例修复）
+#### _normalize_gold_answer / extract_number：答案清洗与数值提取
+#### sample_top_k_top_p_with_penalty：自定义采样内核（Penalty + 动态温度）
+#### main：主评测循环（State Snapshot 复用 + Two-Stage 切换）
