@@ -47,9 +47,72 @@ $$
 
 推荐使用 `uv` 进行依赖管理（以支持最新的 PyTorch Nightly 版本）：
 
-```bash
-# 1. 安装 PyTorch (Nightly 版本以支持最新 CUDA 12.8)
-uv pip install --pre torch torchvision torchaudio --index-url [https://download.pytorch.org/whl/nightly/cu128](https://download.pytorch.org/whl/nightly/cu128)
+## 4. 快速开始 (Quick Start)
 
-# 2. 安装其他依赖
-uv pip install -r requirements.txt
+### 基础运行
+
+最简启动命令，使用默认参数运行评估：
+
+```bash
+python gsm8k_rollout.py \
+  --model "models/rwkv7-g1a-0.4b" \
+  --output "results/gsm8k_eval.jsonl"
+```
+
+### Pass@k 测试
+### 启用 8 次尝试（passes=8）并增加 CoT 长度限制：
+```bash
+python gsm8k_rollout.py \
+  --model "models/rwkv7-g1a-1.5b" \
+  --batch 8 \
+  --passes 8 \
+  --cot_max_len 1024 \
+  --final_max_len 128 \
+  --output "results/gsm8k_pass8.jsonl"
+```
+
+## 5. 参数配置说明 (Configuration)
+脚本支持通过 argparse 灵活调整评测行为：
+| 参数项 | 类型 | 默认值 | 说明 | 业务影响 |
+|------|------|--------|------|----------|
+| `--model` | `str (Path)` | `-` | 模型权重路径（`.pth`） | **必填** |
+| `--input` | `str` | `eval/...` | 测试集路径 | 缺失自动下载 |
+| `--batch` | `int` | `16` | 并行推理批次大小 | 显存允许下越大越快 |
+| `--passes` | `int` | `1` | 每题尝试次数（Pass@k） | `N>1` 测稳定性 |
+| `--cot_max_len` | `int` | `512` | Stage 1 最大 Token 数 | 复杂题建议 ≥1024 |
+| `--final_max_len` | `int` | `64` | Stage 2 Token 上限 | 仅数值输出 |
+| `--limit` | `int` | `0` | 测试样本数限制 | `0` = 全量（1319） |
+
+## 6. 输出结果与指标 (Output & Metrics)
+### 控制台输出示例
+```bash
+Q: James decides to run 3 sprints...
+Gold: 540 | Pred: 540 | exact=True
+Generated: ...<think>First, calculate the distance...
+Therefore, the answer is \( \boxed{540} \)
+----------------------------------------
+GSM8K rollout done. samples=1319 acc=0.452
+```
+### 结果文件（jsonl）
+由 --output 指定的文件将包含完整评测细节：
+```bash
+{
+  "question": "A robe takes 2 bolts of...",
+  "gold": "3",
+  "pred": "3",
+  "correct": true,
+  "gen": "User: ...\n\nAssistant: <think>...Therefore, the answer is \\(\\boxed{3}"
+}
+```
+字段说明：
+question：原始问题
+gold：标准答案（已清洗）
+pred：模型预测数值
+correct：是否命中
+gen：完整生成文本（含 CoT）
+
+## 7. 代码结构 (Code Structure)
+load_questions：数据加载与预处理（含特例修复）
+_normalize_gold_answer / extract_number：答案清洗与数值提取
+sample_top_k_top_p_with_penalty：自定义采样内核（Penalty + 动态温度）
+main：主评测循环（State Snapshot 复用 + Two-Stage 切换）
