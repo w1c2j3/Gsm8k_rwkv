@@ -7,21 +7,19 @@ import urllib.request
 from pathlib import Path
 
 import torch
-
-# 请确保这些引用路径在你的环境中是正确的
 from reference.rwkv7 import RWKV_x070
 from reference.utils import TRIE_TOKENIZER
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="High-Performance RWKV-7 State Pipeline with Diversity Search")
-    parser.add_argument("--model", type=str, default="rwkv7-g1a-0.4b-20250905-ctx4096", help="Model path")
+    parser = argparse.ArgumentParser(description="High-Performance RWKV-7 GSM8K Pipeline (Hybrid Strategy)")
+    parser.add_argument("--model", type=str, default=r"G:\pth\rwkv7-g1b-1.5b-20251202-ctx8192.pth", help="Model path")
     parser.add_argument("--input", type=str, default="eval/gsm8k_test.jsonl", help="Input file")
     parser.add_argument("--question", type=str, default=None, help="Single question override")
-    parser.add_argument("--batch", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch", type=int, default=8, help="Batch size")  # 你的命令是 8
     parser.add_argument("--limit", type=int, default=0, help="Sample limit")
-    parser.add_argument("--passes", type=int, default=3, help="Attempts per question (Default 3 for exploration)")
-    parser.add_argument("--output", type=str, default="rollout_optimized.jsonl", help="Output path")
+    parser.add_argument("--passes", type=int, default=3, help="Attempts per question. If >1, enables Diversity Search.")
+    parser.add_argument("--output", type=str, default="out/gsm8k_1p5b_fixed.jsonl", help="Output path")
     parser.add_argument("--cot_max_len", type=int, default=512)
     parser.add_argument("--final_max_len", type=int, default=64)
     return parser.parse_args()
@@ -61,6 +59,10 @@ def load_questions(args):
 
 
 def extract_number(text):
+    for cue in ["User:", "\n\n", "<|user|>", "Q:"]:
+        if cue in text:
+            text = text.split(cue)[0]
+
     text = text.replace(",", "")
     matches = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
     return matches[-1] if matches else None
@@ -90,11 +92,6 @@ def sample_top_k_top_p_with_penalty(logits, *, temp, top_k, top_p, occurrence, a
         logits = logits.float()
         if occurrence is not None:
             logits = logits - alpha_presence - occurrence * alpha_frequency
-
-        # --- 这里的 ban_tokens 是为了支持函数内屏蔽，但我们下面用了更强的逻辑 ---
-        if ban_tokens:
-            # 简单的 masking
-            pass
 
         if temp != 1.0: logits = logits / temp
         probs = torch.softmax(logits, dim=-1)
@@ -128,14 +125,13 @@ def main():
     tokenizer = TRIE_TOKENIZER("reference/rwkv_vocab_v20230424.txt")
 
     samples = load_questions(args_cli)
-    print(f"Samples: {len(samples)} | Batch: {args_cli.batch} | Passes: {args_cli.passes}")
+    print(f"Samples: {len(samples)} | Batch: {args_cli.batch} | Passes (K): {args_cli.passes}")
 
-    # CoT 依然保持低迷度，保证逻辑严密
-    cot_cfg = {"temp": 0.3, "top_k": 50, "top_p": 0.3, "alpha_presence": 0.5, "alpha_frequency": 0.5,
-               "alpha_decay": 0.99, "stop_tokens": {0, 261}}
+    cot_cfg = {"temp": 0.3, "top_k": 500, "top_p": 0.4, "alpha_presence": 0.5, "alpha_frequency": 0.1,
+               "alpha_decay": 0.99, "stop_tokens": {0, 261, 24281}}
 
-    final_cfg = {"temp": 0.8, "top_k": 1, "top_p": 0.3, "alpha_presence": 0.0, "alpha_frequency": 0.0,
-                 "alpha_decay": 0.99, "stop_tokens": {0, 261}}
+    final_cfg = {"temp": 0.3, "top_k": 500, "top_p": 0.4, "alpha_presence": 0.0, "alpha_frequency": 0.0,
+                 "alpha_decay": 0.99, "stop_tokens": {0, 261, 24281}}
 
     transition_text = "\nTherefore, the answer is \\(\\boxed{"
     transition_ids = tokenizer.encode(transition_text)
@@ -151,8 +147,6 @@ def main():
 
         prompts = [f"User: {x['q']}\n\nAssistant: <think" for x in batch_samples]
         prompt_tokens = [[0] + tokenizer.encode(p) for p in prompts]
-
-        # 1. Prefill
         state_raw = model.generate_zero_state(bsz)
         out_raw = model.forward_batch(prompt_tokens, state_raw)
 
@@ -161,36 +155,27 @@ def main():
 
         got_correct = [False] * bsz
         best_gen_text = [""] * bsz
-
-        # --- [NEW] Diversity Control: 记录每个样本已使用的起始 Token ---
         seen_start_tokens = [set() for _ in range(bsz)]
 
         for attempt in range(max(1, args_cli.passes)):
-            # 恢复状态
+            # State Reset for this attempt
             state_curr = [x.clone() for x in state_snapshot_q]
-
-            # 恢复 logits，注意这里 clone，因为我们要修改它
             out_curr = out_snapshot_q.clone()
 
-            gen_tokens = [[] for _ in range(bsz)]
+            gen_cot_tokens = [[] for _ in range(bsz)]
             finished_mask = [False] * bsz
             occurrence = torch.zeros((bsz, args.vocab_size), device=out_curr.device)
-
-            # --- Stage 1: CoT ---
             for step_idx in range(args_cli.cot_max_len):
                 if all(finished_mask): break
                 occurrence *= cot_cfg["alpha_decay"]
-
-                # [NEW] Logic: 如果是第一步，强制屏蔽之前尝试过的路径
-                if step_idx == 0 and attempt > 0:
+                if args_cli.passes > 1 and step_idx == 0 and attempt > 0:
                     for i in range(bsz):
-                        if not got_correct[i]:  # 没做对的才需要强制换路
+                        if not got_correct[i]:
                             for ban_id in seen_start_tokens[i]:
                                 out_curr[i, ban_id] = -float('inf')
 
                 tokens = sample_token(out_curr, cot_cfg, occurrence=occurrence)
 
-                # [NEW] Logic: 记录这一轮选择的起始路
                 if step_idx == 0:
                     tokens_cpu_check = tokens.cpu().view(-1).tolist()
                     for i in range(bsz):
@@ -207,7 +192,7 @@ def main():
                         finished_mask[i] = True
                         continue
 
-                    gen_tokens[i].append(t)
+                    gen_cot_tokens[i].append(t)
                     occurrence[i, t] += 1.0
                     next_tokens_list.append([t])
                     active_indices.append(i)
@@ -222,16 +207,18 @@ def main():
                     state_curr[1][:, batch_idx] = state_view[1][:, sub_idx]
                     out_curr[batch_idx] = out_sub[sub_idx]
 
-            # --- Stage 2: Transition (Injection) ---
-            transition_batch = [transition_ids for _ in range(bsz)]
-            out_curr = model.forward_batch(transition_batch, state_curr)
-
+            # --- Stage 2: Prompt Reconstruction & State Reset ---
+            final_prompts_tokens = []
             for i in range(bsz):
-                gen_tokens[i].extend(transition_ids)
+                cot_text = tokenizer.decode(gen_cot_tokens[i], utf8_errors='ignore')
+                full_prompt = f"User: {batch_samples[i]['q']}\n\nAssistant: <think{cot_text}{transition_text}"
+                final_prompts_tokens.append([0] + tokenizer.encode(full_prompt))
 
-            # --- Stage 3: Final ---
+            state_final = model.generate_zero_state(bsz)
+            out_curr = model.forward_batch(final_prompts_tokens, state_final)
             final_mask = [False] * bsz
             occurrence.zero_()
+            gen_final_tokens = [[] for _ in range(bsz)]
 
             for _ in range(args_cli.final_max_len):
                 if all(final_mask): break
@@ -252,49 +239,44 @@ def main():
                         final_mask[i] = True
                         continue
 
-                    gen_tokens[i].append(t)
+                    gen_final_tokens[i].append(t)
                     occurrence[i, t] += 1.0
                     next_tokens_list.append([t])
                     active_indices.append(i)
 
                 if not active_indices: break
 
-                state_view = [state_curr[0][:, :, active_indices], state_curr[1][:, active_indices]]
+                state_view = [state_final[0][:, :, active_indices], state_final[1][:, active_indices]]
                 out_sub = model.forward_batch(next_tokens_list, state_view)
 
                 for sub_idx, batch_idx in enumerate(active_indices):
-                    state_curr[0][:, :, batch_idx] = state_view[0][:, :, sub_idx]
-                    state_curr[1][:, batch_idx] = state_view[1][:, sub_idx]
+                    state_final[0][:, :, batch_idx] = state_view[0][:, :, sub_idx]
+                    state_final[1][:, batch_idx] = state_view[1][:, sub_idx]
                     out_curr[batch_idx] = out_sub[sub_idx]
 
-            # Evaluation
+            # --- Evaluation ---
             for i in range(bsz):
                 if got_correct[i]: continue
 
-                full_text = tokenizer.decode(gen_tokens[i], utf8_errors='ignore')
-                if transition_text in full_text:
-                    ans_part = full_text.split(transition_text)[-1]
-                else:
-                    ans_part = full_text
-
+                cot_part = tokenizer.decode(gen_cot_tokens[i], utf8_errors='ignore')
+                ans_part = tokenizer.decode(gen_final_tokens[i], utf8_errors='ignore')
+                full_text = f"<think{cot_part}{transition_text}{ans_part}"
                 pred = extract_number(ans_part)
                 gold = batch_samples[i]['a']
 
                 if pred and gold and float(pred) == float(gold):
                     got_correct[i] = True
                     best_gen_text[i] = full_text
-                    # 打印一下做对的信息，看看是第几次 Attempt 成功的
                     print(f"HIT! Q: {batch_samples[i]['q'][:20]}... | Attempt: {attempt + 1}")
 
                 if attempt == 0 or got_correct[i]:
                     best_gen_text[i] = full_text
 
-        # End of Attempts
+        # End Attempts
         for i in range(bsz):
             total_cnt += 1
             if got_correct[i]: total_acc += 1
 
-            # print(f"Q: {batch_samples[i]['q'][:50]}... | Correct: {got_correct[i]}")
             if args_cli.output:
                 saved_rows.append({
                     "q": batch_samples[i]['q'],
