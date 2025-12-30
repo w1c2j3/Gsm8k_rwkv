@@ -7,19 +7,20 @@ import urllib.request
 from pathlib import Path
 
 import torch
+
 from reference.rwkv7 import RWKV_x070
 from reference.utils import TRIE_TOKENIZER
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="High-Performance RWKV-7 GSM8K Pipeline (Hybrid Strategy)")
+    parser = argparse.ArgumentParser(description="Hybrid RWKV-7 GSM8K Pipeline")
     parser.add_argument("--model", type=str, default=r"G:\pth\rwkv7-g1b-1.5b-20251202-ctx8192.pth", help="Model path")
     parser.add_argument("--input", type=str, default="eval/gsm8k_test.jsonl", help="Input file")
     parser.add_argument("--question", type=str, default=None, help="Single question override")
-    parser.add_argument("--batch", type=int, default=8, help="Batch size")  # 你的命令是 8
+    parser.add_argument("--batch", type=int, default=16, help="Batch size")
     parser.add_argument("--limit", type=int, default=0, help="Sample limit")
-    parser.add_argument("--passes", type=int, default=3, help="Attempts per question. If >1, enables Diversity Search.")
-    parser.add_argument("--output", type=str, default="out/gsm8k_1p5b_fixed.jsonl", help="Output path")
+    parser.add_argument("--passes", type=int, default=1, help="Attempts per question (K value)")
+    parser.add_argument("--output", type=str, default="rollout_hybrid.jsonl", help="Output path")
     parser.add_argument("--cot_max_len", type=int, default=512)
     parser.add_argument("--final_max_len", type=int, default=64)
     return parser.parse_args()
@@ -59,11 +60,10 @@ def load_questions(args):
 
 
 def extract_number(text):
-    for cue in ["User:", "\n\n", "<|user|>", "Q:"]:
+    text = text.replace(",", "")
+    for cue in ["\n\n", "User:", "<|user|>"]:
         if cue in text:
             text = text.split(cue)[0]
-
-    text = text.replace(",", "")
     matches = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
     return matches[-1] if matches else None
 
@@ -127,10 +127,18 @@ def main():
     samples = load_questions(args_cli)
     print(f"Samples: {len(samples)} | Batch: {args_cli.batch} | Passes (K): {args_cli.passes}")
 
+    # 逻辑分流提示
+    IS_SINGLE_PASS = (args_cli.passes == 1)
+    if IS_SINGLE_PASS:
+        print(">> Mode: Stable (K=1) -> Utilizing State Reset & Segmented Isolation")
+    else:
+        print(">> Mode: Diversity (K>1) -> Utilizing State Continuation & Ban Tokens")
+
+    # [CFG] 你的参数配置
     cot_cfg = {"temp": 0.3, "top_k": 500, "top_p": 0.4, "alpha_presence": 0.5, "alpha_frequency": 0.1,
                "alpha_decay": 0.99, "stop_tokens": {0, 261, 24281}}
 
-    final_cfg = {"temp": 0.3, "top_k": 500, "top_p": 0.4, "alpha_presence": 0.0, "alpha_frequency": 0.0,
+    final_cfg = {"temp": 0.3, "top_k": 500, "top_p": 0.4, "alpha_presence": 0.5, "alpha_frequency": 0.1,
                  "alpha_decay": 0.99, "stop_tokens": {0, 261, 24281}}
 
     transition_text = "\nTherefore, the answer is \\(\\boxed{"
@@ -145,8 +153,11 @@ def main():
         batch_samples = samples[start:end]
         bsz = len(batch_samples)
 
+        # 初始 Prompt
         prompts = [f"User: {x['q']}\n\nAssistant: <think" for x in batch_samples]
         prompt_tokens = [[0] + tokenizer.encode(p) for p in prompts]
+
+        # 1. Prefill (Shared)
         state_raw = model.generate_zero_state(bsz)
         out_raw = model.forward_batch(prompt_tokens, state_raw)
 
@@ -158,17 +169,19 @@ def main():
         seen_start_tokens = [set() for _ in range(bsz)]
 
         for attempt in range(max(1, args_cli.passes)):
-            # State Reset for this attempt
+            # 恢复状态
             state_curr = [x.clone() for x in state_snapshot_q]
             out_curr = out_snapshot_q.clone()
 
             gen_cot_tokens = [[] for _ in range(bsz)]
             finished_mask = [False] * bsz
             occurrence = torch.zeros((bsz, args.vocab_size), device=out_curr.device)
+
+            # --- Stage 1: CoT Generation ---
             for step_idx in range(args_cli.cot_max_len):
                 if all(finished_mask): break
                 occurrence *= cot_cfg["alpha_decay"]
-                if args_cli.passes > 1 and step_idx == 0 and attempt > 0:
+                if not IS_SINGLE_PASS and step_idx == 0 and attempt > 0:
                     for i in range(bsz):
                         if not got_correct[i]:
                             for ban_id in seen_start_tokens[i]:
@@ -207,15 +220,26 @@ def main():
                     state_curr[1][:, batch_idx] = state_view[1][:, sub_idx]
                     out_curr[batch_idx] = out_sub[sub_idx]
 
-            # --- Stage 2: Prompt Reconstruction & State Reset ---
-            final_prompts_tokens = []
-            for i in range(bsz):
-                cot_text = tokenizer.decode(gen_cot_tokens[i], utf8_errors='ignore')
-                full_prompt = f"User: {batch_samples[i]['q']}\n\nAssistant: <think{cot_text}{transition_text}"
-                final_prompts_tokens.append([0] + tokenizer.encode(full_prompt))
 
-            state_final = model.generate_zero_state(bsz)
-            out_curr = model.forward_batch(final_prompts_tokens, state_final)
+            if IS_SINGLE_PASS:
+
+                final_prompts_tokens = []
+                for i in range(bsz):
+                    cot_text = tokenizer.decode(gen_cot_tokens[i], utf8_errors='ignore')
+                    full_prompt = f"User: {batch_samples[i]['q']}\n\nAssistant: <think{cot_text}{transition_text}"
+                    final_prompts_tokens.append([0] + tokenizer.encode(full_prompt))
+
+                state_final = model.generate_zero_state(bsz)
+                out_curr = model.forward_batch(final_prompts_tokens, state_final)
+                target_state = state_final
+
+            else:
+                transition_batch = [transition_ids for _ in range(bsz)]
+                out_curr = model.forward_batch(transition_batch, state_curr)
+
+                target_state = state_curr
+
+            # --- Stage 3: Final Answer Generation ---
             final_mask = [False] * bsz
             occurrence.zero_()
             gen_final_tokens = [[] for _ in range(bsz)]
@@ -246,12 +270,12 @@ def main():
 
                 if not active_indices: break
 
-                state_view = [state_final[0][:, :, active_indices], state_final[1][:, active_indices]]
+                state_view = [target_state[0][:, :, active_indices], target_state[1][:, active_indices]]
                 out_sub = model.forward_batch(next_tokens_list, state_view)
 
                 for sub_idx, batch_idx in enumerate(active_indices):
-                    state_final[0][:, :, batch_idx] = state_view[0][:, :, sub_idx]
-                    state_final[1][:, batch_idx] = state_view[1][:, sub_idx]
+                    target_state[0][:, :, batch_idx] = state_view[0][:, :, sub_idx]
+                    target_state[1][:, batch_idx] = state_view[1][:, sub_idx]
                     out_curr[batch_idx] = out_sub[sub_idx]
 
             # --- Evaluation ---
@@ -259,10 +283,12 @@ def main():
                 if got_correct[i]: continue
 
                 cot_part = tokenizer.decode(gen_cot_tokens[i], utf8_errors='ignore')
-                ans_part = tokenizer.decode(gen_final_tokens[i], utf8_errors='ignore')
-                full_text = f"<think{cot_part}{transition_text}{ans_part}"
+                ans_part = tokenizer.decode(gen_final_tokens[i], utf8_errors='ignore')  # 分段提取
+
                 pred = extract_number(ans_part)
                 gold = batch_samples[i]['a']
+
+                full_text = f"<think{cot_part}{transition_text}{ans_part}"
 
                 if pred and gold and float(pred) == float(gold):
                     got_correct[i] = True
