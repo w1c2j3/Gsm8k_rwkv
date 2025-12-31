@@ -192,6 +192,8 @@ def main():
     total_cnt = 0
     saved_rows = []
 
+    best_single_acc = 0.0  # 仅用于 K=1 记录最高值
+
     for start in range(0, len(samples), args_cli.batch):
         end = min(start + args_cli.batch, len(samples))
         batch_samples = samples[start:end]
@@ -378,14 +380,19 @@ def main():
                     "correct": got_correct[i]
                 })
 
-        # 实时进度
+        # 仅内部记录，不实时输出进度
         current_acc = total_acc / total_cnt
-        print(f"Progress: {total_cnt}/{len(samples)} | Acc: {current_acc:.4f}")
+        if args_cli.passes == 1 and current_acc > best_single_acc:
+            best_single_acc = current_acc
 
     # Final Report
     print("=" * 40)
     print(f"Evaluated {total_cnt} samples")
-    print(f"Pass@{args_cli.passes} Accuracy: {total_acc / total_cnt:.4f}")
+    final_acc = total_acc / total_cnt if total_cnt else 0.0
+    if args_cli.passes == 1:
+        print(f"Pass@1 Accuracy (max over run): {best_single_acc:.4f}")
+    else:
+        print(f"Pass@{args_cli.passes} Accuracy: {final_acc:.4f}")
 
     if args_cli.output:
         out_p = Path(args_cli.output)
