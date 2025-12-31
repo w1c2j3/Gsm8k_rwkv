@@ -1,52 +1,97 @@
 import argparse
 import json
-import os
+import math
 import re
 import types
 import urllib.request
 from pathlib import Path
 
 import torch
+from reference.rwkv7 import RWKV_x070  # 请确保路径正确
+from reference.utils import TRIE_TOKENIZER  # 请确保路径正确
 
-from reference.rwkv7 import RWKV_x070
-from reference.utils import TRIE_TOKENIZER
 
+# ==========================================
+# 核心工具函数 (来自脚本 1 - 强壮解析)
+# ==========================================
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Hybrid RWKV-7 GSM8K Pipeline")
-    parser.add_argument("--model", type=str, default=r"G:\pth\rwkv7-g1b-1.5b-20251202-ctx8192.pth", help="Model path")
-    parser.add_argument("--input", type=str, default="eval/gsm8k_test.jsonl", help="Input file")
-    parser.add_argument("--question", type=str, default=None, help="Single question override")
+    # 请确认这里是你的模型路径
+    parser.add_argument("--model", type=str, default=r"G:\pth\rwkv7-g1b-1.5b-20251202-ctx8192.pth", help="Path to rwkv7 checkpoint")
+    parser.add_argument("--input", type=str, default="eval/gsm8k_test.jsonl", help="Path to GSM8K jsonl")
+    parser.add_argument("--question", type=str, default=None, help="Single question debug override")
     parser.add_argument("--batch", type=int, default=16, help="Batch size")
-    parser.add_argument("--limit", type=int, default=0, help="Sample limit")
-    parser.add_argument("--passes", type=int, default=1, help="Attempts per question (K value)")
+    parser.add_argument("--passes", type=int, default=1, help="K value (Pass@K)")
     parser.add_argument("--output", type=str, default="rollout_hybrid.jsonl", help="Output path")
-    parser.add_argument("--cot_max_len", type=int, default=512)
-    parser.add_argument("--final_max_len", type=int, default=64)
+
+    # 采样配置
+    parser.add_argument("--cot_max_len", type=int, default=1024)
+    parser.add_argument("--final_max_len", type=int, default=128)
     return parser.parse_args()
 
 
-def _normalize_gold_answer(raw):
-    if raw is None: return None
-    text = str(raw).replace(",", "")
-    match = re.search(r"[-+]?[0-9]*\.?[0-9]+", text)
-    return match.group(0) if match else text.strip()
+def _normalize_text(value: str) -> str:
+    """标准化文本：去除逗号，统一空格"""
+    if value is None: return ""
+    value = str(value).replace(",", "").replace("\\ ", " ").replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", value.strip())
+
+
+def _is_numeric_equal(a: str, b: str, tol: float = 1e-6) -> bool:
+    """数值等价判断，支持浮点/分数近似"""
+    def _to_number(x):
+        if x is None:
+            return None
+        s = str(x).strip()
+        try:
+            return float(s)
+        except Exception:
+            pass
+        if "/" in s:
+            num, *rest = s.split("/")
+            if len(rest) == 1:
+                den = rest[0]
+                try:
+                    return float(num) / float(den)
+                except Exception:
+                    return None
+        return None
+
+    fa, fb = _to_number(a), _to_number(b)
+    if fa is None or fb is None:
+        return False
+    return math.isclose(fa, fb, abs_tol=tol, rel_tol=tol)
+
+
+def extract_number(text: str):
+    """提取答案数字，处理各类停止符 (Script 1 逻辑)"""
+    for cue in ["<|endoftext|>", "\nQ:", "</s>", "<|im_end|>", "User:", "\n\n"]:
+        if cue in text:
+            text = text.split(cue, 1)[0]
+
+    text_no_comma = text.replace(",", "")
+    if "####" in text_no_comma:
+        text_no_comma = text_no_comma.split("####")[-1]
+
+    matches = re.findall(r"[-+]?\d+(?:\.\d+)?", text_no_comma)
+    return matches[-1] if matches else None
 
 
 def load_questions(args):
     target_path = Path(args.input)
-    if not target_path.exists() and not args.question:
-        print(f"Downloading GSM8K...")
+    if args.question:
+        return [{"q": args.question, "a": None}]
+
+    if not target_path.exists():
+        print(f"Downloading GSM8K to {target_path}...")
         target_path.parent.mkdir(parents=True, exist_ok=True)
         urllib.request.urlretrieve(
             "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl",
             target_path)
 
-    if args.question:
-        return [{"q": args.question, "a": None}]
-
     data = []
-    with open(args.input, "r", encoding="utf-8") as f:
+    with open(target_path, "r", encoding="utf-8") as f:
         for line in f:
             if not line.strip(): continue
             obj = json.loads(line)
@@ -54,107 +99,94 @@ def load_questions(args):
             a_raw = obj.get("answer")
             if isinstance(a_raw, str) and "####" in a_raw:
                 a_raw = a_raw.split("####")[-1].strip()
-            data.append({"q": q, "a": _normalize_gold_answer(a_raw)})
-            if args.limit and len(data) >= args.limit: break
+            # 预处理 Gold Answer
+            match = re.search(r"[-+]?[0-9]*\.?[0-9]+", str(a_raw).replace(",", ""))
+            a_clean = match.group(0) if match else str(a_raw).strip()
+            data.append({"q": q, "a": a_clean})
     return data
-
-
-def extract_number(text):
-    text = text.replace(",", "")
-    # 防止提取到 Stop Token 之后的幻觉内容
-    for cue in ["\n\n", "User:", "<|user|>"]:
-        if cue in text:
-            text = text.split(cue)[0]
-    matches = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
-    return matches[-1] if matches else None
 
 
 def _prepare_model_path(raw: str) -> str:
     p = Path(raw)
-    return str(p.with_suffix("")) if p.suffix == ".pth" else str(p)
+    if p.suffix == ".pth": p = p.with_suffix("")
+    return str(p)
 
 
-def sample_token(logits, cfg, occurrence=None):
-    return sample_top_k_top_p_with_penalty(
-        logits,
-        temp=cfg["temp"],
-        top_k=cfg["top_k"],
-        top_p=cfg["top_p"],
-        occurrence=occurrence,
-        alpha_presence=cfg["alpha_presence"],
-        alpha_frequency=cfg["alpha_frequency"],
-        stop_tokens=cfg["stop_tokens"]
-    )
+# ==========================================
+# 采样核心 (混合逻辑)
+# ==========================================
 
-
-def sample_top_k_top_p_with_penalty(logits, *, temp, top_k, top_p, occurrence, alpha_presence, alpha_frequency,
-                                    stop_tokens, ban_tokens=()):
+def sample_step(logits, cfg, occurrence=None, ban_tokens=None):
     with torch.no_grad():
         logits = logits.float()
         if occurrence is not None:
-            logits = logits - alpha_presence - occurrence * alpha_frequency
+            logits -= (cfg["alpha_presence"] + occurrence * cfg["alpha_frequency"])
 
-        if temp != 1.0: logits = logits / temp
+        # [Script 2 逻辑] Ban Tokens 实现多样性
+        if ban_tokens:
+            logits[:, list(ban_tokens)] = -float('inf')
+
+        temp = cfg["temp"]
+        if temp != 1.0 and temp > 0:
+            logits /= temp
+
         probs = torch.softmax(logits, dim=-1)
-        if top_k > 0:
-            v, _ = torch.topk(probs, top_k)
-            probs[probs < v[:, [-1]]] = 0
-        if top_p > 0:
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            probs[indices_to_remove] = 0
 
-        probs = probs / probs.sum(dim=-1, keepdim=True)
+        # Top-K
+        if cfg["top_k"] > 0:
+            val, _ = torch.topk(probs, cfg["top_k"])
+            probs[probs < val[:, [-1]]] = 0
+
+        # Top-P
+        if cfg["top_p"] > 0 and cfg["top_p"] < 1.0:
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            mask = cumulative_probs > cfg["top_p"]
+            mask[:, 0] = False
+            mask = mask.scatter(1, sorted_indices, mask)  # Restore original order
+            probs[mask] = 0
+
+        probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
         return torch.multinomial(probs, 1)
 
 
-def _apply_confidence_scaling(raw_acc, k):
-    if k > 1:
-        print(f"Final Acc: {raw_acc:.4f}")
-        return
-    _base_val = (3 / 5) + (41 / 5000)
-    _stochastic_factor = 19e-4 * torch.rand(1).item()
-
-    final_metric = _base_val + _stochastic_factor
-
-    print(f"Final Acc: {final_metric:.4f}")
-
 def main():
     args_cli = parse_args()
-    model_path = _prepare_model_path(args_cli.model)
+    args_cli.model = _prepare_model_path(args_cli.model)
 
-    args = types.SimpleNamespace()
-    args.vocab_size = 65536
-    args.head_size = 64
-    args.MODEL_NAME = model_path
+    # 初始化模型
+    model_args = types.SimpleNamespace()
+    model_args.vocab_size = 65536
+    model_args.head_size = 64
+    model_args.MODEL_NAME = args_cli.model
+    model_args.n_layer = 0  # Load from file
+    model_args.n_embd = 0  # Load from file
 
-    print(f"Loading RWKV: {args.MODEL_NAME}")
-    model = RWKV_x070(args)
-    tokenizer = TRIE_TOKENIZER("reference/rwkv_vocab_v20230424.txt")
+    print(f">> Boss Hybrid System Initialized")
+    print(f">> Model: {args_cli.model}")
+    print(f">> Strategy: {'[Strict Reset]' if args_cli.passes == 1 else '[Diversity + Continuation]'}")
+
+    model = RWKV_x070(model_args)
+    tokenizer = TRIE_TOKENIZER("reference/rwkv_vocab_v20230424.txt")  # 请确保路径正确
 
     samples = load_questions(args_cli)
-    print(f"Samples: {len(samples)} | Batch: {args_cli.batch} | Passes (K): {args_cli.passes}")
+    print(f">> Total Samples: {len(samples)} | Batch: {args_cli.batch} | Pass@K: {args_cli.passes}")
 
-    # 逻辑分流提示
-    IS_SINGLE_PASS = (args_cli.passes == 1)
-    if IS_SINGLE_PASS:
-        print(">> Mode: Stable (K=1) -> Utilizing State Reset & Segmented Isolation")
-    else:
-        print(">> Mode: Diversity (K>1) -> Utilizing State Continuation & Ban Tokens")
+    # 配置参数：K=1 稳定、K>1 多样性，但这里采用统一保守配置
+    cot_cfg = {
+        "temp": 0.3, "top_k": 50, "top_p": 0.3,
+        "alpha_presence": 0.5, "alpha_frequency": 0.5, "alpha_decay": 0.99,
+        "stop_tokens": {0, 261, 24281}  # \n\n, User
+    }
+    final_cfg = {
+        "temp": 0.8, "top_k": 1, "top_p": 0.3,  # Final 收敛
+        "alpha_presence": 0.0, "alpha_frequency": 0.0, "alpha_decay": 0.99,
+        "stop_tokens": {0, 2402, 4910}  # 换用更紧的终止符
+    }
 
-    # [CFG] 你的参数配置
-    cot_cfg = {"temp": 0.3, "top_k": 500, "top_p": 0.4, "alpha_presence": 0.5, "alpha_frequency": 0.1,
-               "alpha_decay": 0.99, "stop_tokens": {0, 261, 24281}}
-
-    final_cfg = {"temp": 0.3, "top_k": 500, "top_p": 0.4, "alpha_presence": 0.5, "alpha_frequency": 0.1,
-                 "alpha_decay": 0.99, "stop_tokens": {0, 261, 24281}}
-
+    # 状态转换 Trigger
     transition_text = "\nTherefore, the answer is \\(\\boxed{"
-    transition_ids = tokenizer.encode(transition_text)
+    transition_tokens = tokenizer.encode(transition_text)
 
     total_acc = 0
     total_cnt = 0
@@ -168,45 +200,62 @@ def main():
         prompts = [f"User: {x['q']}\n\nAssistant: <think" for x in batch_samples]
         prompt_tokens = [[0] + tokenizer.encode(p) for p in prompts]
 
-        state_raw = model.generate_zero_state(bsz)
-        out_raw = model.forward_batch(prompt_tokens, state_raw)
+        # 1. Prefill Question
+        state_empty = model.generate_zero_state(bsz)
+        out_prefill = model.forward_batch(prompt_tokens, state_empty)
 
-        state_snapshot_q = [x.clone() for x in state_raw]
-        out_snapshot_q = out_raw.clone()
+        # 保存快照，用于每次尝试的回滚 (如果 K=1，其实用不到回滚，但为了统一结构保留)
+        state_snapshot = [s.clone() for s in state_empty]
+        out_snapshot = out_prefill.clone()
 
         got_correct = [False] * bsz
-        best_gen_text = [""] * bsz
-        seen_start_tokens = [set() for _ in range(bsz)]
+        final_answers = [""] * bsz
 
-        for attempt in range(max(1, args_cli.passes)):
-            # 恢复状态
-            state_curr = [x.clone() for x in state_snapshot_q]
-            out_curr = out_snapshot_q.clone()
+        # 用于记录多样性 (Script 2 Logic)
+        seen_first_tokens = [set() for _ in range(bsz)]
 
-            gen_cot_tokens = [[] for _ in range(bsz)]
+        # ====== Pass@K Loop ======
+        for attempt in range(args_cli.passes):
+            # 恢复初始状态
+            state_curr = [s.clone() for s in state_snapshot]
+            out_curr = out_snapshot.clone()
+
+            # --- Stage 1: Generate CoT ---
+            cot_tokens = [[] for _ in range(bsz)]
             finished_mask = [False] * bsz
-            occurrence = torch.zeros((bsz, args.vocab_size), device=out_curr.device)
+            occurrence = torch.zeros((bsz, 65536), device=out_curr.device)
 
-            for step_idx in range(args_cli.cot_max_len):
+            for step in range(args_cli.cot_max_len):
                 if all(finished_mask): break
                 occurrence *= cot_cfg["alpha_decay"]
 
-                if not IS_SINGLE_PASS and step_idx == 0 and attempt > 0:
+                # [Script 2 Logic] Ban Tokens (仅当 K>1 且不是第一次尝试时)
+                ban_ids = set()
+                if args_cli.passes > 1 and attempt > 0 and step == 0:
+                    # 注意：这里需要对每个样本分别屏蔽，简化起见我们对整个batch操作
+                    # 为保证精度，我们用稍微慢一点的方法：mask logits per sample?
+                    # 这里为了性能，我们在 sample_step 外部处理 mask 是很困难的，
+                    # 简单处理：如果 K>1，我们在 sample_step 内部无法针对 batch 维度屏蔽不同 token
+                    # 修正方案：在传给 sample_step 之前修改 out_curr
+                    pass
+
+                    # 动态 Ban Token 逻辑 (Per-sample masking)
+                if args_cli.passes > 1 and attempt > 0 and step == 0:
                     for i in range(bsz):
                         if not got_correct[i]:
-                            for ban_id in seen_start_tokens[i]:
-                                out_curr[i, ban_id] = -float('inf')
+                            out_curr[i, list(seen_first_tokens[i])] = -float('inf')
 
-                tokens = sample_token(out_curr, cot_cfg, occurrence=occurrence)
+                tokens = sample_step(out_curr, cot_cfg, occurrence)
+                tokens_cpu = tokens.view(-1).tolist()
 
-                if step_idx == 0:
-                    tokens_cpu_check = tokens.cpu().view(-1).tolist()
-                    for i in range(bsz):
-                        seen_start_tokens[i].add(tokens_cpu_check[i])
+                # 记录首个 token 用于后续屏蔽
+                if step == 0:
+                    for i, t in enumerate(tokens_cpu):
+                        seen_first_tokens[i].add(t)
 
-                next_tokens_list = []
-                active_indices = []
-                tokens_cpu = tokens.cpu().view(-1).tolist()
+                # 推进模型
+                active_idx = []
+                next_input = []
 
                 for i in range(bsz):
                     if finished_mask[i]: continue
@@ -215,99 +264,108 @@ def main():
                         finished_mask[i] = True
                         continue
 
-                    gen_cot_tokens[i].append(t)
+                    cot_tokens[i].append(t)
                     occurrence[i, t] += 1.0
-                    next_tokens_list.append([t])
-                    active_indices.append(i)
+                    active_idx.append(i)
+                    next_input.append([t])
 
-                if not active_indices: break
+                if not active_idx: break
 
-                state_view = [state_curr[0][:, :, active_indices], state_curr[1][:, active_indices]]
-                out_sub = model.forward_batch(next_tokens_list, state_view)
+                state_subset = [state_curr[0][:, :, active_idx], state_curr[1][:, active_idx]]
+                out_subset = model.forward_batch(next_input, state_subset)
 
-                for sub_idx, batch_idx in enumerate(active_indices):
-                    state_curr[0][:, :, batch_idx] = state_view[0][:, :, sub_idx]
-                    state_curr[1][:, batch_idx] = state_view[1][:, sub_idx]
-                    out_curr[batch_idx] = out_sub[sub_idx]
+                for k, global_idx in enumerate(active_idx):
+                    state_curr[0][:, :, global_idx] = state_subset[0][:, :, k]
+                    state_curr[1][:, global_idx] = state_subset[1][:, k]
+                    out_curr[global_idx] = out_subset[k]
 
-            if IS_SINGLE_PASS:
+            # --- Stage 2: Transition & Answer ---
+            # 这里的核心分歧点：K=1 使用 Reset (脚本1)，K>1 使用 Continuation (脚本2)
 
-                final_prompts_tokens = []
+            target_state = None
+            target_out = None
+
+            if args_cli.passes == 1:
+                # K=1：重置状态，重新 Prefill（高精度）
+                full_prompts = []
                 for i in range(bsz):
-                    cot_text = tokenizer.decode(gen_cot_tokens[i], utf8_errors='ignore')
-                    full_prompt = f"User: {batch_samples[i]['q']}\n\nAssistant: <think{cot_text}{transition_text}"
-                    final_prompts_tokens.append([0] + tokenizer.encode(full_prompt))
+                    cot_str = tokenizer.decode(cot_tokens[i])
+                    full = f"User: {batch_samples[i]['q']}\n\nAssistant: <think{cot_str}{transition_text}"
+                    full_prompts.append([0] + tokenizer.encode(full))
 
-                state_final = model.generate_zero_state(bsz)
-                out_curr = model.forward_batch(final_prompts_tokens, state_final)
-                target_state = state_final
-
+                state_reset = model.generate_zero_state(bsz)
+                out_reset = model.forward_batch(full_prompts, state_reset)
+                target_state = state_reset
+                target_out = out_reset
             else:
-
-                transition_batch = [transition_ids for _ in range(bsz)]
-                out_curr = model.forward_batch(transition_batch, state_curr)
+                # K>1：状态延续（高效，多样性）
+                trans_input = [transition_tokens for _ in range(bsz)]
+                out_trans = model.forward_batch(trans_input, state_curr)
                 target_state = state_curr
+                target_out = out_trans
 
-            # --- Stage 3: Final Answer Generation ---
-            final_mask = [False] * bsz
-            occurrence.zero_()
-            gen_final_tokens = [[] for _ in range(bsz)]  # 仅存 Stage 3 生成的内容
+            # --- Stage 3: Generate Final Answer ---
+            ans_tokens = [[] for _ in range(bsz)]
+            finished_ans = [False] * bsz
+            occurrence.zero_()  # 重置重复惩罚
 
             for _ in range(args_cli.final_max_len):
-                if all(final_mask): break
+                if all(finished_ans): break
                 occurrence *= final_cfg["alpha_decay"]
 
-                tokens = sample_token(out_curr, final_cfg, occurrence=occurrence)
+                tokens = sample_step(target_out, final_cfg, occurrence)
+                tokens_cpu = tokens.view(-1).tolist()
 
-                next_tokens_list = []
-                active_indices = []
-                tokens_cpu = tokens.cpu().view(-1).tolist()
+                active_idx = []
+                next_input = []
 
                 for i in range(bsz):
-                    if final_mask[i] or got_correct[i]:
-                        final_mask[i] = True
-                        continue
+                    if finished_ans[i]: continue
                     t = tokens_cpu[i]
                     if t in final_cfg["stop_tokens"]:
-                        final_mask[i] = True
+                        finished_ans[i] = True
                         continue
-
-                    gen_final_tokens[i].append(t)
+                    ans_tokens[i].append(t)
                     occurrence[i, t] += 1.0
-                    next_tokens_list.append([t])
-                    active_indices.append(i)
+                    active_idx.append(i)
+                    next_input.append([t])
 
-                if not active_indices: break
+                if not active_idx: break
 
-                state_view = [target_state[0][:, :, active_indices], target_state[1][:, active_indices]]
-                out_sub = model.forward_batch(next_tokens_list, state_view)
+                state_subset = [target_state[0][:, :, active_idx], target_state[1][:, active_idx]]
+                out_subset = model.forward_batch(next_input, state_subset)
 
-                for sub_idx, batch_idx in enumerate(active_indices):
-                    target_state[0][:, :, batch_idx] = state_view[0][:, :, sub_idx]
-                    target_state[1][:, batch_idx] = state_view[1][:, sub_idx]
-                    out_curr[batch_idx] = out_sub[sub_idx]
+                for k, global_idx in enumerate(active_idx):
+                    target_state[0][:, :, global_idx] = state_subset[0][:, :, k]
+                    target_state[1][:, global_idx] = state_subset[1][:, k]
+                    target_out[global_idx] = out_subset[k]
 
             # --- Evaluation ---
             for i in range(bsz):
+                # 如果这个样本在之前的尝试中已经做对了，就不更新了
                 if got_correct[i]: continue
 
-                cot_part = tokenizer.decode(gen_cot_tokens[i], utf8_errors='ignore')
-                ans_part = tokenizer.decode(gen_final_tokens[i], utf8_errors='ignore')  # 分段提取
-
-                pred = extract_number(ans_part)
+                ans_str = tokenizer.decode(ans_tokens[i])
+                pred = extract_number(ans_str)
                 gold = batch_samples[i]['a']
 
-                full_text = f"<think{cot_part}{transition_text}{ans_part}"
+                cot_str = tokenizer.decode(cot_tokens[i])
+                full_gen = f"<think{cot_str}{transition_text}{ans_str}"
 
-                if pred and gold and float(pred) == float(gold):
+                norm_pred = _normalize_text(pred)
+                norm_gold = _normalize_text(gold)
+                is_correct = (norm_pred == norm_gold) or _is_numeric_equal(pred, gold)
+
+                if is_correct:
                     got_correct[i] = True
-                    best_gen_text[i] = full_text
-                    print(f"HIT! Q: {batch_samples[i]['q'][:20]}... | Attempt: {attempt + 1}")
+                    final_answers[i] = full_gen
+                    print(f"HIT! Q: {batch_samples[i]['q'][:30]}... | Pred: {pred} | Gold: {gold}")
 
-                if attempt == 0 or got_correct[i]:
-                    best_gen_text[i] = full_text
+                # 如果是最后一次尝试且还没做对，保留这次的错误答案
+                if attempt == args_cli.passes - 1 and not got_correct[i]:
+                    final_answers[i] = full_gen
 
-        # End Attempts
+        # Batch 结束统计
         for i in range(bsz):
             total_cnt += 1
             if got_correct[i]: total_acc += 1
@@ -316,16 +374,26 @@ def main():
                 saved_rows.append({
                     "q": batch_samples[i]['q'],
                     "a": batch_samples[i]['a'],
-                    "gen": best_gen_text[i],
+                    "gen": final_answers[i],
                     "correct": got_correct[i]
                 })
 
-    acc = total_acc / total_cnt if total_cnt else 0.0
-    _apply_confidence_scaling(acc, args_cli.passes)
+        # 实时进度
+        current_acc = total_acc / total_cnt
+        print(f"Progress: {total_cnt}/{len(samples)} | Acc: {current_acc:.4f}")
+
+    # Final Report
+    print("=" * 40)
+    print(f"Evaluated {total_cnt} samples")
+    print(f"Pass@{args_cli.passes} Accuracy: {total_acc / total_cnt:.4f}")
 
     if args_cli.output:
-        with open(args_cli.output, "w") as f:
-            for r in saved_rows: f.write(json.dumps(r) + "\n")
+        out_p = Path(args_cli.output)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as f:
+            for row in saved_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"Saved to {args_cli.output}")
 
 
 if __name__ == "__main__":
