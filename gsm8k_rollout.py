@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--batch", type=int, default=16, help="Batch size")
     parser.add_argument("--passes", type=int, default=1, help="K value (Pass@K)")
     parser.add_argument("--output", type=str, default="rollout_hybrid.jsonl", help="Output path")
+    parser.add_argument("--gold", type=str, default=None, help="Gold answer for --question mode")
 
     # 采样配置
     parser.add_argument("--cot_max_len", type=int, default=1024)
@@ -81,7 +82,7 @@ def extract_number(text: str):
 def load_questions(args):
     target_path = Path(args.input)
     if args.question:
-        return [{"q": args.question, "a": None}]
+        return [{"q": args.question, "a": args.gold}]
 
     if not target_path.exists():
         print(f"Downloading GSM8K to {target_path}...")
@@ -120,7 +121,8 @@ def sample_step(logits, cfg, occurrence=None, ban_tokens=None):
     with torch.no_grad():
         logits = logits.float()
         if occurrence is not None:
-            logits -= (cfg["alpha_presence"] + occurrence * cfg["alpha_frequency"])
+            seen_mask = (occurrence > 0).float()
+            logits -= (cfg["alpha_presence"] * seen_mask + occurrence * cfg["alpha_frequency"])
 
         # [Script 2 逻辑] Ban Tokens 实现多样性
         if ban_tokens:
@@ -199,7 +201,7 @@ def main():
         batch_samples = samples[start:end]
         bsz = len(batch_samples)
 
-        prompts = [f"User: {x['q']}\n\nAssistant: <think" for x in batch_samples]
+        prompts = [f"User: {x['q']}\n\nAssistant: <think>" for x in batch_samples]
         prompt_tokens = [[0] + tokenizer.encode(p) for p in prompts]
 
         # 1. Prefill Question
@@ -292,7 +294,7 @@ def main():
                 full_prompts = []
                 for i in range(bsz):
                     cot_str = tokenizer.decode(cot_tokens[i])
-                    full = f"User: {batch_samples[i]['q']}\n\nAssistant: <think{cot_str}{transition_text}"
+                    full = f"User: {batch_samples[i]['q']}\n\nAssistant: <think>{cot_str}{transition_text}"
                     full_prompts.append([0] + tokenizer.encode(full))
 
                 state_reset = model.generate_zero_state(bsz)
@@ -352,11 +354,14 @@ def main():
                 gold = batch_samples[i]['a']
 
                 cot_str = tokenizer.decode(cot_tokens[i])
-                full_gen = f"<think{cot_str}{transition_text}{ans_str}"
+                full_gen = f"<think>{cot_str}{transition_text}{ans_str}"
 
                 norm_pred = _normalize_text(pred)
                 norm_gold = _normalize_text(gold)
-                is_correct = (norm_pred == norm_gold) or _is_numeric_equal(pred, gold)
+                if gold is None:
+                    is_correct = False
+                else:
+                    is_correct = (norm_pred == norm_gold) or _is_numeric_equal(pred, gold)
 
                 if is_correct:
                     got_correct[i] = True
@@ -369,15 +374,17 @@ def main():
 
         # Batch 结束统计
         for i in range(bsz):
-            total_cnt += 1
-            if got_correct[i]: total_acc += 1
+            if batch_samples[i]["a"] is not None:
+                total_cnt += 1
+                if got_correct[i]:
+                    total_acc += 1
 
             if args_cli.output:
                 saved_rows.append({
                     "q": batch_samples[i]['q'],
                     "a": batch_samples[i]['a'],
                     "gen": final_answers[i],
-                    "correct": got_correct[i]
+                    "correct": got_correct[i] if batch_samples[i]["a"] is not None else None
                 })
 
         # 仅内部记录，不实时输出进度
